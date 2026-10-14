@@ -73,6 +73,7 @@ class HNRConfig(BaseConfig):
     enable_site_config: Optional[bool] = False  # 启用站点独立配置
     site_config_str: Optional[str] = None  # 站点独立配置的字符串
     site_configs: Dict[str, SiteConfig] = {}  # 站点独立配置（根据配置字符串解析后的字典）
+    probe_hr_for_subscribe: Optional[bool] = True  # 订阅来源种子H&R探测（RSS报文不携带H&R标志）
 
     @root_validator(pre=True, allow_reuse=True)
     def __check_enums(cls, values):

@@ -9,6 +9,8 @@ from app.sdk.network import SitesHelper
 from app.sdk.logging import logger
 from app.sdk.utilities import StringUtils
 
+from .entities import TaskType
+
 # 全局变量
 siteshelper = SitesHelper()
 
@@ -351,6 +353,132 @@ class TorrentHelper:
         except Exception as e:
             logger.error(f"获取种子标签失败，错误: {e}")
             return []
+
+
+class TaskTypeHelper:
+    """
+    下载任务类型解析帮助类
+
+    主程序通过下载上下文与事件提供下载来源信息，优先按来源解析任务类型；
+    仅在没有任何来源信息的旧版本事件中，才回退到种子详情兜底判断。
+    """
+
+    # 主程序候选资源来源：context.resource_source
+    RSS_SOURCE = "rss"
+    SPIDER_SOURCE = "spider"
+    SEARCH_SOURCE = "search"
+    # 订阅来源的事件来源前缀：事件 source
+    SUBSCRIBE_SOURCE_PREFIX = "Subscribe|"
+    # 自定义订阅插件（RssSubscribe）固定使用的下载用户名
+    RSS_SUBSCRIBE_USERNAME = "RSS订阅"
+
+    @staticmethod
+    def resolve(context: Any = None, torrent_info: Any = None, source: str = None,
+                username: str = None) -> TaskType:
+        """
+        解析下载任务类型
+        :param context: 下载上下文，读取 resource_source（rss/spider/search/unknown）
+        :param torrent_info: 种子信息，仅在没有任何来源信息时兜底判断
+        :param source: 事件来源，以 Subscribe| 开头表示订阅下载
+        :param username: 下载用户名，自定义订阅插件的固定用户名标识 RSS 订阅下载
+        :return: 任务类型
+        """
+        resource_source = str(getattr(context, "resource_source", "") or "").strip().lower()
+        if resource_source == TaskTypeHelper.RSS_SOURCE:
+            # RSS 订阅模式刷新的候选资源
+            return TaskType.RSS_SUBSCRIBE
+        if resource_source == TaskTypeHelper.SPIDER_SOURCE:
+            # 站点订阅（爬虫订阅）模式刷新的候选资源
+            return TaskType.AUTO_SUBSCRIBE
+        if resource_source == TaskTypeHelper.SEARCH_SOURCE:
+            # 搜索下载
+            return TaskType.NORMAL
+        if source and str(source).startswith(TaskTypeHelper.SUBSCRIBE_SOURCE_PREFIX):
+            # 订阅来源但无法区分 RSS / 站点订阅时，按自动订阅处理
+            return TaskType.AUTO_SUBSCRIBE
+        if not source and username and str(username).strip() == TaskTypeHelper.RSS_SUBSCRIBE_USERNAME:
+            # 自定义订阅插件（RssSubscribe）的下载不携带任何来源标识，仅在无事件来源时按固定用户名识别，
+            # 避免名为「RSS订阅」的登录用户手动下载（事件 source=Manual）被误判为订阅来源
+            return TaskType.RSS_SUBSCRIBE
+        # 兼容没有来源信息的旧版本事件：没有种子详情（页面详情）的，均认为是 RSS 订阅
+        return TaskType.NORMAL if getattr(torrent_info, "description", None) else TaskType.RSS_SUBSCRIBE
+
+
+class SiteTorrentHelper:
+    """
+    站点检索结果匹配帮助类
+
+    RSS/订阅来源的种子报文不携带 H&R 标志，需要按资源身份与站点检索结果匹配后回填。
+    """
+
+    @staticmethod
+    def match_torrent(torrent_task: Any, torrents: List[Any]) -> Optional[Any]:
+        """
+        将 H&R 种子任务与站点检索结果按资源身份匹配
+        :param torrent_task: H&R 种子任务
+        :param torrents: 站点检索结果
+        :return: 匹配的站点种子，未匹配时返回 None
+        """
+        if not torrent_task or not torrents:
+            return None
+
+        for torrent in torrents:
+            if SiteTorrentHelper._match_resource(torrent_task=torrent_task, torrent=torrent):
+                return torrent
+        return None
+
+    @staticmethod
+    def _match_resource(torrent_task: Any, torrent: Any) -> bool:
+        """
+        判断站点检索结果是否与 H&R 种子任务为同一资源
+        """
+        if not torrent:
+            return False
+
+        # 详情页面链接一致
+        if (torrent_task.page_url and getattr(torrent, "page_url", None)
+                and torrent_task.page_url == getattr(torrent, "page_url", None)):
+            return True
+        # 种子下载链接一致
+        if (torrent_task.enclosure and getattr(torrent, "enclosure", None)
+                and torrent_task.enclosure == getattr(torrent, "enclosure", None)):
+            return True
+        # 标题与大小均一致（RSS 报文携带大小，可用于区分同名资源）
+        if (torrent_task.title and getattr(torrent, "title", None)
+                and torrent_task.title == getattr(torrent, "title", None)
+                and torrent_task.size and getattr(torrent, "size", None)
+                and float(torrent_task.size) == float(getattr(torrent, "size", 0) or 0)):
+            return True
+        return False
+
+
+class SiteMatchHelper:
+    """
+    站点匹配帮助类
+
+    自定义 RSS 订阅等来源的种子报文不携带站点信息，按资源链接域名反查主程序已配置站点，
+    与根据 tracker 反查站点使用同一套域名匹配调用（StringUtils.get_url_domain + SitesHelper.get_indexer）。
+    """
+
+    @staticmethod
+    def match_site_by_url(url: str) -> Tuple[Optional[int], Optional[str]]:
+        """
+        按资源链接域名匹配主程序已配置站点
+        :param url: 种子详情页面链接或种子下载链接
+        :return: 站点ID与站点名称，未匹配时返回 (None, None)
+        """
+        if not url:
+            return None, None
+        try:
+            domain = StringUtils.get_url_domain(url)
+            if not domain:
+                return None, None
+            site = siteshelper.get_indexer(domain)
+            if site:
+                return site.get("id"), site.get("name")
+        except Exception as e:
+            logger.error(f"按链接域名匹配站点出错：{e}")
+        return None, None
 
 
 class TimeHelper:

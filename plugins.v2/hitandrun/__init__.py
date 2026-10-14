@@ -1,5 +1,6 @@
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import fields
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
@@ -20,7 +21,7 @@ from app.modules.qbittorrent import Qbittorrent
 from app.modules.transmission import Transmission
 from app.plugins import _PluginBase
 from app.plugins.hitandrun.entities import HNRStatus, TaskType, TorrentHistory, TorrentTask
-from app.plugins.hitandrun.helper import FormatHelper, TimeHelper, TorrentHelper
+from app.plugins.hitandrun.helper import FormatHelper, SiteMatchHelper, SiteTorrentHelper, TaskTypeHelper, TimeHelper, TorrentHelper
 from app.plugins.hitandrun.hnrconfig import HNRConfig, NotifyMode, SiteConfig
 from app.schemas import NotificationType, ServiceInfo
 from app.schemas.types import EventType
@@ -38,7 +39,7 @@ class HitAndRun(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/InfinityPacer/MoviePilot-Plugins/main/icons/hitandrun.png"
     # 插件版本
-    plugin_version = "1.5.5"
+    plugin_version = "1.7.0"
     # 插件作者
     plugin_author = "InfinityPacer"
     # 作者主页
@@ -49,6 +50,8 @@ class HitAndRun(_PluginBase):
     plugin_order = 24
     # 可使用的用户级别
     auth_level = 2
+    # H&R 探测站点检索超时时间（秒）：事件处理持有全局锁，检索为网络请求，需限制最长阻塞时间
+    PROBE_SEARCH_TIMEOUT_SECONDS = 15
 
     # region 私有属性
     plugin_manager = None
@@ -460,25 +463,24 @@ class HitAndRun(_PluginBase):
                     {
                         'component': 'VRow',
                         "content": [
-                            # {
-                            #     'component': 'VCol',
-                            #     'props': {
-                            #         'cols': 12,
-                            #         'md': 4
-                            #     },
-                            #     'content': [
-                            #         {
-                            #             'component': 'VSwitch',
-                            #             'props': {
-                            #                 'model': 'auto_monitor',
-                            #                 'label': '自动监控（实验性功能）',
-                            #                 'hint': '启用后将定时监控站点个人H&R页面',
-                            #                 'persistent-hint': True
-                            #             }
-                            #         }
-                            #     ]
-                            # },
-
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'probe_hr_for_subscribe',
+                                            'label': '订阅H&R探测',
+                                            'hint': 'RSS/订阅报文不携带H&R标志，开启后按种子标题检索站点回填H&R状态（默认开启，检索带超时保护）；关闭仅跳过检索探测，不影响站点域名回填',
+                                            'persistent-hint': True
+                                        }
+                                    }
+                                ]
+                            },
                         ]
                     },
                     # {
@@ -514,9 +516,10 @@ class HitAndRun(_PluginBase):
                                     {
                                         'component': 'VAlert',
                                         'props': {
-                                            'type': 'error',
+                                            'type': 'info',
                                             'variant': 'tonal',
-                                            'text': '警告：本插件仍在完善阶段，同时并未适配所有场景，如RSS订阅等'
+                                            'text': '提示：已适配 RSS 订阅场景，订阅来源的种子按主程序下载来源识别任务类型，'
+                                                    'RSS 报文缺失的 H&R 标志通过站点检索回填'
                                         }
                                     }
                                 ]
@@ -1300,7 +1303,7 @@ class HitAndRun(_PluginBase):
     @eventmanager.register(EventType.DownloadAdded)
     def handle_download_added_event(self, event: Event = None):
         """
-        处理下载添加事件，支持普通下载和RSS订阅
+        处理下载添加事件，支持普通下载、RSS订阅和站点订阅
         """
         if not self.downloader:
             return
@@ -1311,6 +1314,8 @@ class HitAndRun(_PluginBase):
         torrent_hash = event.event_data.get("hash")
         context: Context = event.event_data.get("context")
         downloader = event.event_data.get("downloader")
+        source = event.event_data.get("source")
+        username = event.event_data.get("username")
         if not downloader:
             logger.info("触发添加下载事件，但没有获取到下载器信息，跳过后续处理")
             return
@@ -1325,8 +1330,9 @@ class HitAndRun(_PluginBase):
 
         torrent_info = context.torrent_info
 
-        # 现阶段，由于获取下载来源涉及主程序大幅调整，暂时处理方案为，如果没有种子详情（页面详情）的，均认为是RSS订阅
-        task_type = TaskType.NORMAL if torrent_info.description else TaskType.RSS_SUBSCRIBE
+        # 主程序提供下载来源信息（context.resource_source、事件 source、下载用户名），按来源解析任务类型
+        task_type = TaskTypeHelper.resolve(context=context, torrent_info=torrent_info,
+                                           source=source, username=username)
         self.__process_event(torrent_hash=torrent_hash, torrent_data=torrent_info, task_type=task_type)
 
     @eventmanager.register(EventType.PluginTriggered)
@@ -1400,9 +1406,15 @@ class HitAndRun(_PluginBase):
                                                   torrent_data=torrent_data,
                                                   task_type=task_type)
 
+        # 自定义 RSS 订阅等来源的种子报文不携带站点信息，按链接域名反查已配置站点
+        self.__backfill_site_from_url(torrent_task=torrent_task)
+
         if torrent_task.site not in self._hnr_config.sites:
             logger.info(f"站点 {torrent_task.site_name} 没有启用 H&R 管理，跳过处理")
             return
+
+        # RSS/订阅来源的种子报文不携带 H&R 标志，先通过站点检索回填，避免漏管理
+        self.__probe_hit_and_run(torrent_task=torrent_task)
 
         self.__init_hr_status(torrent_task=torrent_task)
 
@@ -1502,6 +1514,118 @@ class HitAndRun(_PluginBase):
             torrent_task.hr_status = HNRStatus.IN_PROGRESS
         else:
             torrent_task.hr_status = HNRStatus.UNRESTRICTED
+
+    def __probe_hit_and_run(self, torrent_task: TorrentTask) -> bool:
+        """
+        RSS/订阅来源的种子报文不携带 H&R 标志，通过站点索引检索同资源回填 H&R 状态
+        :param torrent_task: H&R 种子任务
+        :return: 是否探测到 H&R
+        """
+        if not self._hnr_config or not self._hnr_config.probe_hr_for_subscribe:
+            return False
+
+        if torrent_task.hit_and_run:
+            return False
+
+        # 仅处理订阅来源（RSS 订阅、站点订阅）的种子，普通下载的 H&R 标志来自站点搜索结果
+        if torrent_task.task_type not in (TaskType.RSS_SUBSCRIBE, TaskType.AUTO_SUBSCRIBE):
+            return False
+
+        site_config = self.__get_site_config(site_name=torrent_task.site_name)
+        if site_config and site_config.hr_active:
+            # 站点已激活全局 H&R，无需探测
+            return False
+
+        if not torrent_task.site or not torrent_task.title:
+            return False
+
+        site = self.__get_site_by_id(site_id=torrent_task.site)
+        if not site:
+            logger.info(f"站点 {torrent_task.site_name} 不在可用站点列表中，跳过 H&R 探测")
+            return False
+
+        try:
+            site_torrents = self.__search_site_torrents(site=site, keyword=torrent_task.title)
+        except Exception as e:
+            logger.warning(f"站点 {torrent_task.site_name} 检索种子 {torrent_task.title} 出错，跳过 H&R 探测：{e}")
+            return False
+
+        matched_torrent = SiteTorrentHelper.match_torrent(torrent_task=torrent_task, torrents=site_torrents)
+        if not matched_torrent:
+            logger.info(f"站点 {torrent_task.site_name} 未检索到种子 {torrent_task.title} 的 H&R 信息")
+            return False
+
+        if not getattr(matched_torrent, "hit_and_run", False):
+            logger.info(f"站点 {torrent_task.site_name}，种子 {torrent_task.title} 经站点检索确认非 H&R 种子")
+            return False
+
+        torrent_task.hit_and_run = True
+        if not torrent_task.description and getattr(matched_torrent, "description", None):
+            torrent_task.description = matched_torrent.description
+        logger.info(f"站点 {torrent_task.site_name}，种子 {torrent_task.identifier} 经站点检索确认命中 H&R")
+        return True
+
+    def __backfill_site_from_url(self, torrent_task: TorrentTask):
+        """
+        种子报文未携带站点信息时（如自定义 RSS 订阅），按详情/下载链接域名反查已配置站点并回填
+        :param torrent_task: H&R 种子任务
+        """
+        if torrent_task.site:
+            return
+
+        for url in (torrent_task.page_url, torrent_task.enclosure):
+            site_id, site_name = SiteMatchHelper.match_site_by_url(url=url)
+            if site_id:
+                torrent_task.site = site_id
+                torrent_task.site_name = site_name
+                logger.info(f"种子 {torrent_task.identifier} 按链接域名关联到站点 {site_name}")
+                return
+
+    def __get_indexer_module(self):
+        """
+        获取站点索引模块实例，用于检索站点种子信息，不可用时返回 None
+        """
+        try:
+            from app.core.module import ModuleManager
+
+            module_manager = ModuleManager()
+            return module_manager.get_running_module("IndexerModule") if module_manager else None
+        except Exception as e:
+            logger.debug(f"获取站点索引模块失败，跳过 H&R 探测：{e}")
+            return None
+
+    def __get_site_by_id(self, site_id: int) -> Optional[dict]:
+        """
+        根据站点ID获取站点配置
+        """
+        if not site_id:
+            return None
+
+        for site in self.sites_helper.get_indexers() or []:
+            if site.get("id") == site_id:
+                return site
+        return None
+
+    def __search_site_torrents(self, site: dict, keyword: str) -> List[Any]:
+        """
+        检索站点种子，站点索引模块不可用或检索失败时返回空列表
+        """
+        indexer_module = self.__get_indexer_module()
+        if not indexer_module or not hasattr(indexer_module, "search_torrents"):
+            logger.info("站点索引模块不可用，跳过 H&R 探测")
+            return []
+
+        # 检索为站点网络请求且当前持有事件全局锁，超时后放弃本次探测，避免长时间阻塞其他事件
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = pool.submit(indexer_module.search_torrents, site=site, keyword=keyword)
+            return future.result(timeout=self.PROBE_SEARCH_TIMEOUT_SECONDS) or []
+        except FutureTimeoutError:
+            logger.warning(f"站点 {site.get('name')} 检索种子 {keyword} 超过 "
+                           f"{self.PROBE_SEARCH_TIMEOUT_SECONDS} 秒，跳过 H&R 探测")
+            return []
+        finally:
+            pool.shutdown(wait=False)
 
     def __save_torrent_task(self, key: str, torrent_tasks: Dict[str, TorrentTask]):
         """

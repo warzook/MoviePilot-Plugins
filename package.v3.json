@@ -285,12 +285,14 @@
         "name": "H&R助手",
         "description": "监听下载、订阅、刷流等行为，对H&R种子进行自动标签管理。",
         "labels": "站点,H&R",
-        "version": "2.0.0",
+        "version": "2.2.0",
         "icon": "https://raw.githubusercontent.com/InfinityPacer/MoviePilot-Plugins/main/icons/hitandrun.png",
         "author": "InfinityPacer",
         "level": 2,
         "system_version": ">=3.0.0",
         "history": {
+            "v2.2.0": "支持自定义订阅（RssSubscribe）插件的 RSS 下载：按下载用户名识别订阅来源，并按链接域名反查回填缺失的站点信息；订阅H&R探测默认开启（可在配置页关闭），站点检索带超时保护，异常不影响下载处理。",
+            "v2.1.0": "适配 RSS 订阅场景：按主程序下载来源识别任务类型，并通过站点检索回填订阅种子缺失的 H&R 标志。",
             "v2.0.0": "迁移至 MoviePilot V3 稳定接口，保持 H&R 种子标签管理流程。"
         },
         "release": true
